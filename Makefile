@@ -20,7 +20,7 @@ SCRIPT      := garmin_hr_monitor.py
 ADDR        ?=
 TIMEOUT     ?= 0
 
-.PHONY: all install run scan run-addr dump check-sys clean help
+.PHONY: all install run run-plot scan run-addr dump check-sys clean help
 
 all: install
 
@@ -33,7 +33,7 @@ $(VENV)/bin/activate:
 
 install: $(VENV)/bin/activate
 	@echo "→ Installing Python dependencies …"
-	$(PIP) install bleak
+	$(PIP) install bleak matplotlib
 	@echo ""
 	@echo "✓  Done. Run 'make check-sys' to verify system prerequisites."
 
@@ -65,6 +65,9 @@ check-sys:
 run: install
 	$(PYTHON) $(SCRIPT) monitor --timeout $(TIMEOUT)
 
+run-plot: install
+	$(PYTHON) $(SCRIPT) monitor --plot --timeout $(TIMEOUT)
+
 scan: install
 	$(PYTHON) $(SCRIPT) scan
 
@@ -89,6 +92,7 @@ help:
 	@echo ""
 	@echo "  make              install dependencies"
 	@echo "  make run          auto-discover and stream HR"
+	@echo "  make run-plot     stream HR + open live chart window"
 	@echo "  make scan         list nearby BLE devices"
 	@echo "  make run-addr ADDR=<MAC>   connect to specific device"
 	@echo "  make dump [ADDR=<MAC>]     dump all GATT services"

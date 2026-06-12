@@ -24,8 +24,10 @@ import asyncio
 import argparse
 import struct
 import sys
+import threading
+from collections import deque
 from datetime import datetime
-from typing import List, Optional, Tuple
+from typing import Deque, List, Optional, Tuple
 
 from bleak import BleakClient, BleakScanner
 from bleak.backends.device import BLEDevice
@@ -114,6 +116,104 @@ def print_hr(data: dict) -> None:
     if energy is not None:
         parts.append(f"energy={energy} kJ")
     print("  ".join(parts))
+
+
+# ── Live plot ─────────────────────────────────────────────────────────────────
+
+class HRPlot:
+    """
+    Matplotlib live chart running in a background thread.
+
+    - Y-axis starts at [40, 120]; expands automatically if data goes outside.
+    - X-axis shows the last MAX_SAMPLES points; scrolls as new data arrives.
+    - Call push(bpm) from any thread; the plot refreshes on its own timer.
+    """
+
+    MAX_SAMPLES = 300          # rolling window length
+    REFRESH_MS  = 1000         # redraw interval in milliseconds
+    Y_PAD       = 5            # extra bpm padding when auto-expanding y-axis
+    Y_DEFAULT   = (40, 120)
+
+    def __init__(self) -> None:
+        self._bpms: Deque[int] = deque(maxlen=self.MAX_SAMPLES)
+        self._lock = threading.Lock()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def push(self, bpm: int) -> None:
+        with self._lock:
+            self._bpms.append(bpm)
+
+    # ── internal ──────────────────────────────────────────────────────────────
+
+    def _run(self) -> None:
+        import matplotlib
+        matplotlib.use("TkAgg")          # works on Ubuntu without a display server
+        import matplotlib.pyplot as plt
+        import matplotlib.animation as animation
+
+        fig, ax = plt.subplots(figsize=(10, 4))
+        fig.patch.set_facecolor("#1a1a2e")
+        ax.set_facecolor("#16213e")
+        for spine in ax.spines.values():
+            spine.set_color("#444466")
+        ax.tick_params(colors="#aaaacc")
+        ax.yaxis.label.set_color("#aaaacc")
+        ax.xaxis.label.set_color("#aaaacc")
+        ax.set_title("Heart Rate – Live", color="#e0e0ff", fontsize=13, pad=10)
+        ax.set_xlabel("samples (most recent →)", color="#aaaacc")
+        ax.set_ylabel("bpm", color="#aaaacc")
+
+        (line,) = ax.plot([], [], color="#ff4d6d", linewidth=1.8, antialiased=True)
+        fill    = ax.fill_between([], [], alpha=0)   # placeholder; rebuilt each frame
+        hr_text = ax.text(
+            0.98, 0.93, "", transform=ax.transAxes,
+            ha="right", va="top", fontsize=16, fontweight="bold", color="#ff4d6d",
+        )
+
+        ax.set_ylim(*self.Y_DEFAULT)
+        ax.set_xlim(0, self.MAX_SAMPLES)
+        fig.tight_layout(pad=1.5)
+
+        # Keep a reference to the fill poly so we can remove it each frame
+        _fill_ref = [None]
+
+        def update(_frame):
+            with self._lock:
+                data = list(self._bpms)
+
+            if not data:
+                return line, hr_text
+
+            xs = list(range(len(data)))
+            line.set_data(xs, data)
+
+            # X axis – fixed window width, slide when full
+            ax.set_xlim(0, max(self.MAX_SAMPLES, len(data)))
+
+            # Y axis – default [40,120], expand if needed
+            lo = min(self.Y_DEFAULT[0], min(data) - self.Y_PAD)
+            hi = max(self.Y_DEFAULT[1], max(data) + self.Y_PAD)
+            # Round to nearest 5 for cleaner ticks
+            lo = (lo // 5) * 5
+            hi = ((hi + 4) // 5) * 5
+            ax.set_ylim(lo, hi)
+
+            # Rebuild fill_between
+            if _fill_ref[0] is not None:
+                _fill_ref[0].remove()
+            _fill_ref[0] = ax.fill_between(xs, lo, data, alpha=0.15, color="#ff4d6d")
+
+            # Current HR label
+            hr_text.set_text(f"{data[-1]} bpm")
+
+            return line, hr_text
+
+        ani = animation.FuncAnimation(
+            fig, update, interval=self.REFRESH_MS, blit=False, cache_frame_data=False,
+        )
+
+        plt.show()   # blocks until the window is closed
 
 
 # ── Scanning helpers ──────────────────────────────────────────────────────────
@@ -208,7 +308,8 @@ async def list_services(client: BleakClient) -> None:
 
 # ── Main connection loop ──────────────────────────────────────────────────────
 
-async def run(address: Optional[str], stop_after: float, dump_services: bool) -> None:
+async def run(address: Optional[str], stop_after: float, dump_services: bool,
+              show_plot: bool = False) -> None:
     if address:
         print(f"Connecting to {address} …")
         device = address          # bleak accepts a MAC string directly
@@ -230,10 +331,14 @@ async def run(address: Optional[str], stop_after: float, dump_services: bool) ->
 
         stop_event = asyncio.Event()
 
+        plot: Optional[HRPlot] = HRPlot() if show_plot else None
+
         def hr_callback(sender, data: bytearray):
             try:
                 parsed = parse_hr_measurement(data)
                 print_hr(parsed)
+                if plot is not None:
+                    plot.push(parsed["hr_bpm"])
             except Exception as exc:
                 print(f"  [parse error] {exc}  raw={data.hex(' ')}")
 
@@ -281,6 +386,8 @@ def main():
                      help="Stop after N seconds (default: 0 = run forever)")
     mon.add_argument("--dump-services", action="store_true",
                      help="Dump all GATT services and read their values once")
+    mon.add_argument("--plot", action="store_true",
+                     help="Open a live HR chart window (requires matplotlib)")
 
     args = parser.parse_args()
 
@@ -290,6 +397,7 @@ def main():
         args.addr = None
         args.timeout = 0
         args.dump_services = False
+        args.plot = False
 
     if args.command == "scan":
         asyncio.run(cmd_scan(args))
@@ -299,6 +407,7 @@ def main():
                 address=args.addr,
                 stop_after=args.timeout,
                 dump_services=args.dump_services,
+                show_plot=args.plot,
             ))
         except KeyboardInterrupt:
             print("\nStopped.")
